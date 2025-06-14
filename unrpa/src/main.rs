@@ -140,22 +140,14 @@ impl RpaEditor {
         file: &mut File,
     ) -> anyhow::Result<()> {
         for (filename, entry) in index.iter() {
-            println!(
-                "🟢 {} | offset={} | length={} | total={}",
-                filename,
-                entry.offset,
-                entry.length,
-                file.metadata()?.len()
-            );
-
-            if entry.offset + entry.length as u64 > file.metadata()?.len() {
+            if entry.offset + entry.length > file.metadata()?.len() {
                 println!("❌ ERREUR : dépassement du fichier !");
             }
 
             file.seek(SeekFrom::Start(entry.offset))?;
             let mut buffer = vec![0u8; entry.length as usize];
             match file.read_exact(&mut buffer) {
-                Ok(_) => println!("✅ Lecture ok: {filename}"),
+                Ok(_) => {}
                 Err(e) => println!("❌ Lecture échouée: {filename} ({})", e),
             }
         }
@@ -277,9 +269,7 @@ impl RpaEditor {
 
         while pos < data.len() {
             if let Some((filename, filename_end)) = self.extract_filename_at_pos(data, pos) {
-                if let Some(entry) =
-                    self.find_entry_data_after_filename(data, filename_end, &filename)
-                {
+                if let Some(entry) = self.find_entry_data_after_filename(data, filename_end) {
                     indexes.insert(filename, entry);
                     pos = filename_end + 50;
                 } else {
@@ -332,7 +322,6 @@ impl RpaEditor {
         &self,
         data: &[u8],
         start_pos: usize,
-        _filename: &str,
     ) -> Option<RpaFileEntry> {
         let search_end = std::cmp::min(start_pos + 100, data.len());
 
@@ -547,7 +536,7 @@ impl RpaEditor {
                     self.preview_text = Some(text);
                     self.status_message = "Loaded Ren'Py script".to_string();
                 } else {
-                    self.status_message = "Could not decode text file".to_string();
+                    self.status_message = "Could not decode a text file".to_string();
                 }
             } else {
                 let info = self.generate_media_info(filename, &data);
@@ -631,13 +620,12 @@ impl RpaEditor {
         info.push_str("\n💡 Usage Notes:\n");
         info.push_str("• Use 'Extract' to save the file\n");
         info.push_str("• Use 'Open Folder' to extract & view\n");
-        if lower.ends_with(".webm")
-            || lower.ends_with(".mp4")
-            || lower.ends_with(".ogg")
-            || lower.ends_with(".wav")
-            || lower.ends_with(".mp3")
-        {
+        if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3") {
             info.push_str("• use play audio button\n");
+        }
+
+        if lower.ends_with(".webm") || lower.ends_with(".mp4") {
+            info.push_str("• Media preview not available in editor")
         }
 
         info
@@ -649,9 +637,12 @@ impl RpaEditor {
             filename, new_file_path
         );
 
-        let new_path = std::path::Path::new(filename);
+        let new_path = Path::new(filename);
         if !new_path.exists() {
-            return Err(anyhow::anyhow!("Replacement file not found: {}", filename));
+            return Err(anyhow::anyhow!(
+                "Replacement file isn't found: {}",
+                filename
+            ));
         }
 
         if !new_path.is_file() {
@@ -684,7 +675,10 @@ impl RpaEditor {
             );
             Ok(())
         } else {
-            Err(anyhow::anyhow!("File not found in archive: {}", filename))
+            Err(anyhow::anyhow!(
+                "File isn't found in the archive: {}",
+                filename
+            ))
         }
     }
 
@@ -766,7 +760,9 @@ impl RpaEditor {
                 let end = start + entry.length as usize;
                 old_data
                     .get(start..end)
-                    .ok_or_else(|| anyhow::anyhow!("Data not found in old archive for {name}"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Data isn't found in the old archive for {name}")
+                    })?
                     .to_vec()
             };
 
@@ -998,7 +994,7 @@ impl RpaEditor {
     }
 
     fn batch_replace_from_folder(&mut self, folder_path: &str) -> anyhow::Result<usize> {
-        let folder = std::path::Path::new(folder_path);
+        let folder = Path::new(folder_path);
         let mut replaced_count = 0;
 
         for entry in std::fs::read_dir(folder)? {
@@ -1142,7 +1138,7 @@ impl eframe::App for RpaEditor {
                             let file_path = path.to_string_lossy().to_string();
                             println!("🔍 Selected replacement file: {}", file_path);
 
-                            if std::path::Path::new(&file_path).exists() {
+                            if Path::new(&file_path).exists() {
                                 self.file_to_replace = Some((filename.unwrap(), file_path));
                             } else {
                                 self.status_message =
@@ -1152,7 +1148,11 @@ impl eframe::App for RpaEditor {
                         ui.close_menu();
                     }
                 });
-
+                ui.menu_button("View", |ui| {
+                    if ui.button("Archive Statistics").clicked() {
+                        self.show_statistics_dialog = true;
+                    }
+                });
                 if self.modified {
                     ui.colored_label(egui::Color32::YELLOW, "● Modified");
                 }
@@ -1349,11 +1349,7 @@ impl eframe::App for RpaEditor {
                     }
 
                     if ui
-                        .button(if self.is_playing {
-                            "Stop Audio"
-                        } else {
-                            "Play Audio"
-                        })
+                        .button(if self.is_playing { "Stop" } else { "Play" })
                         .clicked()
                     {
                         if self.is_playing {
@@ -1361,9 +1357,22 @@ impl eframe::App for RpaEditor {
                             self.is_playing = false;
                         } else {
                             if let Ok(data) = self.load_file_data(&selected_clone) {
-                                println!("Playing audio {}", selected_clone);
-                                self.audio_player.play_bytes(data);
-                                self.is_playing = true;
+                                if selected_clone.ends_with(".ogg")
+                                    || selected_clone.ends_with(".mp3")
+                                    || selected_clone.ends_with(".wav")
+                                    || selected_clone.ends_with(".flac")
+                                {
+                                    println!("Playing audio {}", selected_clone);
+                                    self.audio_player.play_bytes(data);
+                                    self.is_playing = true;
+                                } else if selected_clone.ends_with(".mp4")
+                                    || selected_clone.ends_with(".avi")
+                                    || selected_clone.ends_with(".mov")
+                                    || selected_clone.ends_with(".mkv")
+                                    || selected_clone.ends_with(".webm")
+                                {
+                                    // play video
+                                }
                             }
                         }
                     }
@@ -1528,9 +1537,8 @@ impl eframe::App for RpaEditor {
                         ui.label("✨ NEW FEATURES:");
                         ui.label("• Enhanced WebP, WebM, OGG support");
                         ui.label("• Advanced .rpyc decompilation");
-                        ui.label("• Auto-backup system");
-                        ui.label("• Batch replace operations");
-                        ui.label("• Advanced filtering & sorting");
+                        ui.label("• Batch replaces operations");
+                        ui.label("• Advanced filtering and sorting");
                         ui.label("• Image zoom controls");
                         ui.label("• File statistics");
                         ui.add_space(10.0);
