@@ -2,24 +2,19 @@
 name = "unrpa"
 version = "0.1.0"
 edition = "2024"
-description = "Advanced RPA archive extractor with parallel processing"
 
 [dependencies]
 # Core
 flate2 = "1.1.1"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-hex = "0.4.3"
 anyhow = "1.0.98"
+rodio = "0.20.1"
 
 # GUI
 eframe = "0.31.1"
 egui = "0.31.1"
-egui_extras = "0.31.1"
 
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 rfd = "0.15"  # File dialogs
 image = "0.25"  # Image preview
-md5 = "0.7"   # Hash calculation
 serde-pickle = "1.2.0"

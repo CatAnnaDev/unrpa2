@@ -1,10 +1,12 @@
-use std::collections::HashMap;
-use std::fs::{File, create_dir_all};
-use std::io::{Seek, SeekFrom, Read, Write};
-use std::path::{Path};
-use flate2::{read::ZlibDecoder, Compression};
 use eframe::egui;
 use flate2::write::ZlibEncoder;
+use flate2::{read::ZlibDecoder, Compression};
+use rodio::{Decoder, OutputStream, Sink};
+use serde_pickle::{DeOptions, Value};
+use std::collections::HashMap;
+use std::fs::{create_dir_all, File};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 struct RpaFileEntry {
@@ -23,7 +25,6 @@ struct BackupEntry {
     timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug)]
 struct RpaEditor {
     version: f32,
     key: u32,
@@ -31,7 +32,6 @@ struct RpaEditor {
     archive_path: Option<String>,
     modified: bool,
 
-    
     selected_file: Option<String>,
     preview_data: Option<Vec<u8>>,
     preview_image: Option<egui::ColorImage>,
@@ -42,17 +42,13 @@ struct RpaEditor {
     add_file_name: String,
     status_message: String,
 
-    
     file_to_preview: Option<String>,
     file_to_remove: Option<String>,
     file_to_replace: Option<(String, String)>,
     batch_replace_to_execute: Option<String>,
 
-    
     show_dump_dialog: bool,
-    dump_in_progress: bool,
 
-    
     show_backup_dialog: bool,
     backup_history: Vec<BackupEntry>,
     show_batch_replace_dialog: bool,
@@ -61,14 +57,15 @@ struct RpaEditor {
     auto_backup: bool,
     compression_level: u32,
 
-    
-    filter_type: String,  
-    sort_by: String,      
+    filter_type: String,
+    sort_by: String,
     sort_ascending: bool,
 
-    
     image_zoom: f32,
     hex_view_offset: usize,
+
+    audio_player: AudioPlayer,
+    is_playing: bool,
 }
 
 impl Default for RpaEditor {
@@ -92,10 +89,8 @@ impl Default for RpaEditor {
             file_to_remove: None,
             file_to_replace: None,
             batch_replace_to_execute: None,
-            show_dump_dialog: true,
-            dump_in_progress: false,
+            show_dump_dialog: false,
 
-            
             show_backup_dialog: false,
             backup_history: Vec::new(),
             show_batch_replace_dialog: false,
@@ -110,6 +105,8 @@ impl Default for RpaEditor {
 
             image_zoom: 1.0,
             hex_view_offset: 0,
+            audio_player: AudioPlayer::new(),
+            is_playing: false,
         }
     }
 }
@@ -119,69 +116,15 @@ impl RpaEditor {
         Self::default()
     }
 
-    fn extract_all(&mut self, output_dir: &str) {
-        if self.indexes.is_empty() {
-            self.status_message = "Aucun fichier à extraire".to_string();
-            return;
-        }
-
-        if let Err(e) = create_dir_all(output_dir) {
-            self.status_message = format!("Erreur de création du dossier : {}", e);
-            return;
-        }
-
-        let mut file = match File::open(self.archive_path.as_ref().unwrap()) {
-            Ok(f) => f,
-            Err(e) => {
-                self.status_message = format!("Erreur d'ouverture de l'archive : {}", e);
-                return;
-            }
-        };
-
-        for (name, entry) in &self.indexes {
-            if entry.to_delete {
-                continue;
-            }
-
-            let mut buffer = vec![0; entry.length as usize];
-            if file.seek(SeekFrom::Start(entry.offset)).is_ok()
-                && file.read_exact(&mut buffer).is_ok()
-            {
-                let result = if entry.prefix == b"RPAD".to_vec() {
-                    let mut decoder = ZlibDecoder::new(&buffer[..]);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed).map(|_| decompressed)
-                } else {
-                    Ok(buffer)
-                };
-
-                if let Ok(data) = result {
-                    let dest_path = Path::new(output_dir).join(name);
-                    if let Some(parent) = dest_path.parent() {
-                        let _ = create_dir_all(parent);
-                    }
-                    if let Ok(mut out_file) = File::create(dest_path) {
-                        let _ = out_file.write_all(&data);
-                    }
-                }
-            }
-        }
-
-        self.status_message = format!("Extraction terminée vers `{}`", output_dir);
-    }
-
     fn load_rpa(&mut self, path: &str) -> anyhow::Result<()> {
         let mut file = File::open(path)?;
 
-        
         self.version = self.get_version(&mut file)?;
 
-        
         self.indexes = self.extract_indexes(&mut file)?;
         self.archive_path = Some(path.to_string());
         self.modified = false;
 
-        
         self.selected_file = None;
         self.preview_data = None;
         self.preview_image = None;
@@ -189,6 +132,80 @@ impl RpaEditor {
 
         self.status_message = format!("Loaded {} files from {}", self.indexes.len(), path);
         Ok(())
+    }
+
+    fn load_entries_data(
+        &self,
+        index: &mut HashMap<String, RpaFileEntry>,
+        file: &mut File,
+    ) -> anyhow::Result<()> {
+        for (filename, entry) in index.iter() {
+            println!(
+                "🟢 {} | offset={} | length={} | total={}",
+                filename,
+                entry.offset,
+                entry.length,
+                file.metadata()?.len()
+            );
+
+            if entry.offset + entry.length as u64 > file.metadata()?.len() {
+                println!("❌ ERREUR : dépassement du fichier !");
+            }
+
+            file.seek(SeekFrom::Start(entry.offset))?;
+            let mut buffer = vec![0u8; entry.length as usize];
+            match file.read_exact(&mut buffer) {
+                Ok(_) => println!("✅ Lecture ok: {filename}"),
+                Err(e) => println!("❌ Lecture échouée: {filename} ({})", e),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn parse_index_pickle(&self, data: &[u8]) -> anyhow::Result<HashMap<String, RpaFileEntry>> {
+        let value: Value = serde_pickle::value_from_slice(data, DeOptions::new().decode_strings())?;
+
+        let mut indexes = HashMap::new();
+
+        if let Value::Dict(dict) = value {
+            for (key, val) in dict {
+                let filename = key.to_string().replace("\"", "");
+
+                if let Value::List(list) = val {
+                    if list.len() == 1 {
+                        if let Value::Tuple(tuple) = &list[0] {
+                            if tuple.len() == 3 {
+                                if let (
+                                    Value::I64(offset),
+                                    Value::I64(length),
+                                    Value::Bytes(prefix),
+                                ) = (&tuple[0], &tuple[1], &tuple[2])
+                                {
+                                    let offset = *offset as u64 ^ self.key as u64;
+                                    let length = *length as u64 ^ self.key as u64;
+                                    indexes.insert(
+                                        filename.clone(),
+                                        RpaFileEntry {
+                                            offset,
+                                            length,
+                                            prefix: prefix.clone(),
+                                            data: None,
+                                            modified: false,
+                                            to_delete: false,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(indexes)
+        } else {
+            Err(anyhow::anyhow!("Pickle root is not a dict"))
+        }
     }
 
     fn get_version(&self, file: &mut File) -> anyhow::Result<f32> {
@@ -202,15 +219,19 @@ impl RpaEditor {
             Ok(3.2)
         } else if header.starts_with("RPA-3.0 ") {
             Ok(3.0)
+        } else if header.starts_with("RPA-2") {
+            Ok(2.0)
         } else {
             Err(anyhow::anyhow!("Unsupported RPA version"))
         }
     }
 
-    fn extract_indexes(&mut self, file: &mut File) -> anyhow::Result<HashMap<String, RpaFileEntry>> {
+    fn extract_indexes(
+        &mut self,
+        file: &mut File,
+    ) -> anyhow::Result<HashMap<String, RpaFileEntry>> {
         file.seek(SeekFrom::Start(0))?;
         let mut line = Vec::new();
-
         let mut byte = [0u8; 1];
         while file.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
             line.push(byte[0]);
@@ -224,7 +245,6 @@ impl RpaEditor {
         if self.version >= 3.0 {
             self.key = 0;
             let key_start = if self.version >= 3.2 { 3 } else { 2 };
-
             for &key_part in &parts[key_start..] {
                 let subkey = u32::from_str_radix(key_part, 16)?;
                 self.key ^= subkey;
@@ -239,7 +259,16 @@ impl RpaEditor {
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed)?;
 
-        self.parse_binary_dict(&decompressed)
+        match self.parse_index_pickle(&decompressed) {
+            Ok(mut indexes) => {
+                self.load_entries_data(&mut indexes, file)?;
+                Ok(indexes)
+            }
+            Err(e) => {
+                eprintln!("⚠️ Erreur pickle: {e}, on tente l'extraction heuristique...");
+                self.parse_binary_dict(&decompressed)
+            }
+        }
     }
 
     fn parse_binary_dict(&self, data: &[u8]) -> anyhow::Result<HashMap<String, RpaFileEntry>> {
@@ -248,7 +277,9 @@ impl RpaEditor {
 
         while pos < data.len() {
             if let Some((filename, filename_end)) = self.extract_filename_at_pos(data, pos) {
-                if let Some(entry) = self.find_entry_data_after_filename(data, filename_end, &filename) {
+                if let Some(entry) =
+                    self.find_entry_data_after_filename(data, filename_end, &filename)
+                {
                     indexes.insert(filename, entry);
                     pos = filename_end + 50;
                 } else {
@@ -266,7 +297,7 @@ impl RpaEditor {
         let mut pos = start_pos;
 
         while pos < data.len() {
-            if data[pos].is_ascii_alphabetic() {
+            if data[pos].is_ascii_graphic() || data[pos] == b'/' {
                 break;
             }
             pos += 1;
@@ -277,30 +308,32 @@ impl RpaEditor {
         }
 
         let filename_start = pos;
-        let mut filename_end = pos;
 
-        while filename_end < data.len() {
-            let byte = data[filename_end];
+        let is_valid_char = |c: u8| {
+            c.is_ascii() && (c as char).is_ascii_graphic() && !"\"\\:*?<>|".contains(c as char)
+        };
 
-            if !byte.is_ascii() || (!byte.is_ascii_alphanumeric() && !"/_.-".contains(byte as char)) {
-                break;
-            }
-
-            filename_end += 1;
+        while pos < data.len() && is_valid_char(data[pos]) {
+            pos += 1;
         }
 
-        if filename_end > filename_start + 4 {
-            if let Ok(filename) = String::from_utf8(data[filename_start..filename_end].to_vec()) {
-                if self.is_valid_filename(&filename) {
-                    return Some((filename, filename_end));
-                }
+        let slice = &data[filename_start..pos];
+
+        if let Ok(filename) = std::str::from_utf8(slice) {
+            if self.is_valid_filename(filename) {
+                return Some((filename.to_string(), pos));
             }
         }
 
         None
     }
 
-    fn find_entry_data_after_filename(&self, data: &[u8], start_pos: usize, _filename: &str) -> Option<RpaFileEntry> {
+    fn find_entry_data_after_filename(
+        &self,
+        data: &[u8],
+        start_pos: usize,
+        _filename: &str,
+    ) -> Option<RpaFileEntry> {
         let search_end = std::cmp::min(start_pos + 100, data.len());
 
         for pos in start_pos..search_end {
@@ -324,13 +357,18 @@ impl RpaEditor {
     }
 
     fn extract_j_values_at(&self, data: &[u8], pos: usize) -> Option<(u64, u64, Vec<u8>)> {
-        if pos + 11 < data.len() && data[pos] == b'J' {
-            let val1_bytes = [data[pos+1], data[pos+2], data[pos+3], data[pos+4]];
+        if pos + 9 < data.len() && data[pos] == b'J' {
+            let val1_bytes = [data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]];
             let val1 = u32::from_le_bytes(val1_bytes);
 
             for next_pos in (pos + 5)..(pos + 15) {
-                if next_pos + 5 < data.len() && data[next_pos] == b'J' {
-                    let val2_bytes = [data[next_pos+1], data[next_pos+2], data[next_pos+3], data[next_pos+4]];
+                if next_pos + 4 < data.len() && data[next_pos] == b'J' {
+                    let val2_bytes = [
+                        data[next_pos + 1],
+                        data[next_pos + 2],
+                        data[next_pos + 3],
+                        data[next_pos + 4],
+                    ];
                     let val2 = u32::from_le_bytes(val2_bytes);
 
                     let offset = (val1 ^ self.key) as u64;
@@ -347,20 +385,24 @@ impl RpaEditor {
     }
 
     fn is_valid_filename(&self, filename: &str) -> bool {
-        if filename.len() < 5 || filename.len() > 200 {
+        if filename.len() < 2 || filename.len() > 200 {
             return false;
         }
 
-        let extensions = [".png", ".jpg", ".jpeg", ".webp", ".webm", ".ogg", ".wav", ".mp3", ".rpy", ".rpyc"];
-        let lower = filename.to_lowercase();
+        let extensions = [
+            ".png", ".jpg", ".jpeg", ".webp", ".webm", ".avi", ".mp4", ".mov", ".ogg", ".wav",
+            ".mp3", ".flac", ".rpy", ".rpyc",
+        ];
 
-        extensions.iter().any(|&ext| lower.ends_with(ext))
+        extensions.iter().any(|&ext| filename.ends_with(ext))
     }
 
     fn is_reasonable_entry(&self, offset: u64, length: u64) -> bool {
-        offset > 50 && offset < 2_000_000_000 &&
-            length > 0 && length < 500_000_000 &&
-            offset + length < 2_000_000_000
+        offset > 50
+            && offset < 2_000_000_000
+            && length > 0
+            && length < 500_000_000
+            && offset + length < 2_000_000_000
     }
 
     fn load_file_data(&self, filename: &str) -> anyhow::Result<Vec<u8>> {
@@ -388,7 +430,6 @@ impl RpaEditor {
         Err(anyhow::anyhow!("File not found"))
     }
 
-    
     fn decompile_rpyc(&self, data: &[u8]) -> Option<String> {
         if data.len() < 16 {
             return None;
@@ -398,11 +439,9 @@ impl RpaEditor {
         result.push_str("# Decompiled .rpyc file\n");
         result.push_str("# Enhanced decompilation with pattern recognition\n\n");
 
-        
         let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
         result.push_str(&format!("# Python bytecode magic: 0x{:08X}\n", magic));
 
-        
         let mut pos = 16;
         let mut found_strings = Vec::new();
         let mut labels = Vec::new();
@@ -410,17 +449,21 @@ impl RpaEditor {
 
         while pos < data.len() {
             if pos + 4 < data.len() {
-                let str_len = u32::from_le_bytes([
-                    data[pos], data[pos+1], data[pos+2], data[pos+3]
-                ]) as usize;
+                let str_len =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
 
                 if str_len > 0 && str_len < 1000 && pos + 4 + str_len < data.len() {
-                    if let Ok(s) = String::from_utf8(data[pos+4..pos+4+str_len].to_vec()) {
-                        if s.len() > 2 && s.chars().all(|c| c.is_ascii_graphic() || c.is_whitespace()) {
-                            
+                    if let Ok(s) = String::from_utf8(data[pos + 4..pos + 4 + str_len].to_vec()) {
+                        if s.len() > 2
+                            && s.chars().all(|c| c.is_ascii_graphic() || c.is_whitespace())
+                        {
                             if s.starts_with("label_") || s.starts_with("scene_") {
                                 labels.push(s.clone());
-                            } else if s.len() < 30 && s.chars().any(|c| c.is_alphabetic()) && !s.contains(' ') {
+                            } else if s.len() < 30
+                                && s.chars().any(|c| c.is_alphabetic())
+                                && !s.contains(' ')
+                            {
                                 characters.push(s.clone());
                             } else {
                                 found_strings.push(s);
@@ -434,7 +477,6 @@ impl RpaEditor {
             pos += 1;
         }
 
-        
         if !labels.is_empty() {
             result.push_str("\n# === LABELS DETECTED ===\n");
             for label in &labels {
@@ -445,7 +487,10 @@ impl RpaEditor {
         if !characters.is_empty() {
             result.push_str("\n# === CHARACTERS DETECTED ===\n");
             for character in &characters {
-                result.push_str(&format!("define {} = Character(\"{}\")\n", character, character));
+                result.push_str(&format!(
+                    "define {} = Character(\"{}\")\n",
+                    character, character
+                ));
             }
         }
 
@@ -466,57 +511,57 @@ impl RpaEditor {
             self.preview_data = Some(data.clone());
             self.preview_image = None;
             self.preview_text = None;
-            self.image_zoom = 1.0; 
-            self.hex_view_offset = 0; 
+            self.image_zoom = 1.0;
+            self.hex_view_offset = 0;
 
             let lower = filename.to_lowercase();
 
-            
-            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") {
+            if lower.ends_with(".png")
+                || lower.ends_with(".jpg")
+                || lower.ends_with(".jpeg")
+                || lower.ends_with(".webp")
+            {
                 if let Ok(img) = image::load_from_memory(&data) {
                     let rgba = img.to_rgba8();
                     let size = [rgba.width() as usize, rgba.height() as usize];
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &rgba);
                     self.preview_image = Some(color_image);
-                    self.status_message = format!("Loaded image: {}×{} ({:.1} KB)",
-                                                  rgba.width(), rgba.height(), data.len() as f32 / 1024.0);
+                    self.status_message = format!(
+                        "Loaded image: {}×{} ({:.1} KB)",
+                        rgba.width(),
+                        rgba.height(),
+                        data.len() as f32 / 1024.0
+                    );
                 } else {
                     self.status_message = "Failed to load image".to_string();
                 }
-            }
-            
-            else if lower.ends_with(".rpyc") {
+            } else if lower.ends_with(".rpyc") {
                 if let Some(decompiled) = self.decompile_rpyc(&data) {
                     self.preview_text = Some(decompiled);
                     self.status_message = "Decompiled .rpyc file (enhanced extraction)".to_string();
                 } else {
                     self.status_message = "Could not decompile .rpyc file".to_string();
                 }
-            }
-            
-            else if lower.ends_with(".rpy") {
+            } else if lower.ends_with(".rpy") {
                 if let Ok(text) = String::from_utf8(data.clone()) {
                     self.preview_text = Some(text);
                     self.status_message = "Loaded Ren'Py script".to_string();
                 } else {
                     self.status_message = "Could not decode text file".to_string();
                 }
-            }
-            
-            else {
+            } else {
                 let info = self.generate_media_info(filename, &data);
                 self.preview_text = Some(info);
-                self.status_message = format!("Loaded {} ({:.1} KB)", filename, data.len() as f32 / 1024.0);
+                self.status_message =
+                    format!("Loaded {} ({:.1} KB)", filename, data.len() as f32 / 1024.0);
             }
         }
     }
 
-    
     fn generate_media_info(&self, filename: &str, data: &[u8]) -> String {
         let lower = filename.to_lowercase();
         let mut info = String::new();
 
-        
         if lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".avi") {
             info.push_str("🎬 Video File Analysis\n");
             info.push_str("═══════════════════════\n\n");
@@ -529,9 +574,12 @@ impl RpaEditor {
         }
 
         info.push_str(&format!("📁 Filename: {}\n", filename));
-        info.push_str(&format!("📊 Size: {} ({} bytes)\n", Self::format_bytes(data.len() as u64), data.len()));
+        info.push_str(&format!(
+            "📊 Size: {} ({} bytes)\n",
+            Self::format_bytes(data.len() as u64),
+            data.len()
+        ));
 
-        
         if lower.ends_with(".webm") && data.len() > 20 {
             info.push_str("🎬 Format: WebM (VP8/VP9)\n");
             if data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
@@ -556,7 +604,6 @@ impl RpaEditor {
             if &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
                 info.push_str("✅ Valid WAV header detected\n");
 
-                
                 let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
                 let byte_rate = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
                 let bits_per_sample = u16::from_le_bytes([data[34], data[35]]);
@@ -581,91 +628,69 @@ impl RpaEditor {
             }
         }
 
-        
-        let hash = md5::compute(data);
-        info.push_str(&format!("\n🔐 MD5: {:x}\n", hash));
-
-        
         info.push_str("\n💡 Usage Notes:\n");
         info.push_str("• Use 'Extract' to save the file\n");
         info.push_str("• Use 'Open Folder' to extract & view\n");
-        if lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3") {
-            info.push_str("• Media preview not available in editor\n");
+        if lower.ends_with(".webm")
+            || lower.ends_with(".mp4")
+            || lower.ends_with(".ogg")
+            || lower.ends_with(".wav")
+            || lower.ends_with(".mp3")
+        {
+            info.push_str("• use play audio button\n");
         }
 
         info
     }
 
-    fn create_backup(&self, filename: &str) -> anyhow::Result<()> {
-        if let Ok(data) = self.load_file_data(filename) {
-            let backup = BackupEntry {
-                filename: filename.to_string(),
-                data,
-                timestamp: chrono::Utc::now(),
-            };
-            
-            
-        }
-        Ok(())
-    }
-
-    fn create_full_backup(&self) -> anyhow::Result<()> {
-        if let Some(ref path) = self.archive_path {
-            let backup_path = format!("{}.backup.{}", path, chrono::Utc::now().format("%Y%m%d_%H%M%S"));
-            std::fs::copy(path, backup_path)?;
-            println!("📦 Created backup");
-        }
-        Ok(())
-    }
-
-
     fn replace_file(&mut self, filename: &str, new_file_path: &str) -> anyhow::Result<()> {
-        println!("🔄 Attempting to replace {} with {}", filename, new_file_path);
+        println!(
+            "🔄 Attempting to replace {} with {}",
+            filename, new_file_path
+        );
 
-        
         let new_path = std::path::Path::new(filename);
         if !new_path.exists() {
             return Err(anyhow::anyhow!("Replacement file not found: {}", filename));
         }
 
-        
         if !new_path.is_file() {
             return Err(anyhow::anyhow!("Path is not a file: {}", filename));
         }
 
-        
-        let new_data = std::fs::read(filename)
-            .map_err(|e| anyhow::anyhow!("Failed to read replacement file '{}': {}", filename, e))?;
+        let new_data = std::fs::read(filename).map_err(|e| {
+            anyhow::anyhow!("Failed to read replacement file '{}': {}", filename, e)
+        })?;
 
-        println!("✅ Successfully read {} bytes from {}", new_data.len(), new_file_path);
+        println!(
+            "✅ Successfully read {} bytes from {}",
+            new_data.len(),
+            new_file_path
+        );
 
-        
         if let Some(entry) = self.indexes.get_mut(new_file_path) {
-            
-
-
-            
             entry.data = Some(new_data.clone());
             entry.modified = true;
-            entry.length = new_data.len() as u64; 
+            entry.length = new_data.len() as u64;
             self.modified = true;
 
             self.status_message = format!("Replaced: {} ({} bytes)", filename, new_data.len());
 
-            println!("✅ Replaced {} with {} ({} bytes)", filename, new_file_path, new_data.len());
+            println!(
+                "✅ Replaced {} with {} ({} bytes)",
+                filename,
+                new_file_path,
+                new_data.len()
+            );
             Ok(())
         } else {
             Err(anyhow::anyhow!("File not found in archive: {}", filename))
         }
     }
 
-
-
-    
     fn add_file(&mut self, file_path: &str, archive_name: &str) -> anyhow::Result<()> {
         let data = std::fs::read(file_path)?;
 
-        
         if self.auto_backup && self.indexes.contains_key(archive_name) {
             if let Ok(old_data) = self.load_file_data(archive_name) {
                 let backup = BackupEntry {
@@ -674,7 +699,7 @@ impl RpaEditor {
                     timestamp: chrono::Utc::now(),
                 };
                 self.backup_history.push(backup);
-                
+
                 if self.backup_history.len() > 10 {
                     self.backup_history.remove(0);
                 }
@@ -682,10 +707,10 @@ impl RpaEditor {
         }
 
         let entry = RpaFileEntry {
-            offset: 0, 
+            offset: 0,
             length: data.len() as u64,
             prefix: Vec::new(),
-            data: Some(data), 
+            data: Some(data),
             modified: true,
             to_delete: false,
         };
@@ -695,9 +720,17 @@ impl RpaEditor {
         self.modified = true;
 
         if is_new {
-            self.status_message = format!("Added {} ({} total files)", archive_name, self.indexes.len());
+            self.status_message = format!(
+                "Added {} ({} total files)",
+                archive_name,
+                self.indexes.len()
+            );
         } else {
-            self.status_message = format!("Replaced {} ({} total files)", archive_name, self.indexes.len());
+            self.status_message = format!(
+                "Replaced {} ({} total files)",
+                archive_name,
+                self.indexes.len()
+            );
         }
 
         Ok(())
@@ -711,267 +744,68 @@ impl RpaEditor {
         }
     }
 
-    fn create_index_data(&self, indexes: &HashMap<String, RpaFileEntry>) -> anyhow::Result<Vec<u8>> {
-        
-        let mut data = Vec::new();
+    //
 
-        
-        for (filename, entry) in indexes {
-            let name_bytes = filename.as_bytes();
+    pub fn save_rpa(&self, archive_path: &str) -> anyhow::Result<()> {
+        let old_data = std::fs::read(&self.archive_path.clone().unwrap())?;
+        let mut offset = 0x34;
+        let mut out = File::create(archive_path)?;
 
-            
-            data.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        out.seek(SeekFrom::Start(offset))?;
 
-            
-            data.extend_from_slice(name_bytes);
+        let mut new_indexes = HashMap::new();
 
-            
-            data.extend_from_slice(&entry.offset.to_le_bytes());
+        let mut files: Vec<_> = self.indexes.iter().collect();
+        files.sort_by_key(|(k, _)| *k);
 
-            
-            data.extend_from_slice(&entry.length.to_le_bytes());
-
-            println!("📝 Index entry: {} -> offset={}, length={}", filename, entry.offset, entry.length);
-        }
-
-        
-        if self.key != 0 {
-            for (i, byte) in data.iter_mut().enumerate() {
-                let key_byte = ((self.key >> (8 * (i % 4))) & 0xFF) as u8;
-                *byte ^= key_byte;
-            }
-            println!("🔐 Index obfuscated with key: 0x{:08X}", self.key);
-        }
-
-        println!("📊 Created index: {} bytes for {} files", data.len(), indexes.len());
-        Ok(data)
-    }
-
-    fn debug_original_index_structure(&self) -> anyhow::Result<()> {
-        use flate2::read::ZlibDecoder;
-        use std::io::Read;
-
-        let mut file = File::open(self.archive_path.as_ref().unwrap())?;
-
-        
-        let mut header = [0u8; 34];
-        file.read_exact(&mut header)?;
-        let header_str = String::from_utf8_lossy(&header);
-
-        let parts: Vec<&str> = header_str.trim_end_matches('\0').trim().split_whitespace().collect();
-        let index_offset = u64::from_str_radix(parts[1], 16)?;
-
-        
-        file.seek(SeekFrom::Start(index_offset))?;
-        let mut compressed_data = Vec::new();
-        file.read_to_end(&mut compressed_data)?;
-
-        let mut decoder = ZlibDecoder::new(&compressed_data[..]);
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed)?;
-
-        println!("🔍 Decompressed index: {} bytes", decompressed.len());
-        println!("🔍 Raw pickle data (first 100 bytes): {:02X?}", &decompressed[..std::cmp::min(100, decompressed.len())]);
-
-        
-
-        
-        match serde_pickle::from_slice::<HashMap<String, Vec<(u64, u64)>>>(&decompressed, Default::default()) {
-            Ok(index) => {
-                println!("✅ Format 1 (Vec<(u64, u64)>) works! {} entries", index.len());
-                if let Some((filename, values)) = index.iter().next() {
-                    println!("📝 Sample: {} -> {:?}", filename, values);
-                }
-                return Ok(());
-            },
-            Err(e) => println!("❌ Format 1 failed: {}", e),
-        }
-
-        
-        match serde_pickle::from_slice::<HashMap<String, Vec<Vec<u64>>>>(&decompressed, Default::default()) {
-            Ok(index) => {
-                println!("✅ Format 2 (Vec<Vec<u64>>) works! {} entries", index.len());
-                if let Some((filename, values)) = index.iter().next() {
-                    println!("📝 Sample: {} -> {:?}", filename, values);
-                }
-                return Ok(());
-            },
-            Err(e) => println!("❌ Format 2 failed: {}", e),
-        }
-
-        
-        match serde_pickle::from_slice::<HashMap<String, (Vec<u64>, Vec<u8>)>>(&decompressed, Default::default()) {
-            Ok(index) => {
-                println!("✅ Format 3 ((Vec<u64>, Vec<u8>)) works! {} entries", index.len());
-                if let Some((filename, (offsets, prefix))) = index.iter().next() {
-                    println!("📝 Sample: {} -> ({:?}, {:?})", filename, offsets, prefix);
-                }
-                return Ok(());
-            },
-            Err(e) => println!("❌ Format 3 failed: {}", e),
-        }
-
-        println!("❌ All known formats failed!");
-        Ok(())
-    }
-
-    fn verify_file_integrity(&self, filename: &str, offset: u64, length: u64) -> anyhow::Result<bool> {
-        use std::io::Read;
-
-        let mut file = File::open(self.archive_path.as_ref().unwrap())?;
-        file.seek(SeekFrom::Start(offset))?;
-
-        
-        let mut buffer = vec![0u8; std::cmp::min(100, length as usize)];
-        match file.read_exact(&mut buffer) {
-            Ok(_) => {
-                println!("✅ {} accessible at offset {} (first bytes: {:02X?})",
-                         filename, offset, &buffer[..std::cmp::min(10, buffer.len())]);
-                Ok(true)
-            },
-            Err(e) => {
-                println!("❌ {} NOT accessible at offset {}: {}", filename, offset, e);
-                Ok(false)
-            }
-        }
-    }
-
-    pub fn save_rpa(&mut self, output_path: &str) -> anyhow::Result<()> {
-        let archive_path = Path::new(output_path);
-        let parent = archive_path.parent().unwrap_or_else(|| Path::new("."));
-        if let Err(e) = create_dir_all(parent) {
-            self.status_message = format!("Erreur création dossier : {}", e);
-            return Ok(());
-        }
-
-        let mut file = match File::create(output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                self.status_message = format!("Erreur écriture fichier : {}", e);
-                return Ok(());
-            }
-        };
-
-        
-        let mut new_index = HashMap::new();
-        let mut data_start_offset = 0u64;
-
-        
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(b"RPA-3.0 ")?; 
-        file.write_all(format!("{:016x} ", self.hex_view_offset).as_bytes())?;
-        file.write_all(format!("{:08x} ", self.key).as_bytes())?;
-        file.write_all(b" \n")?;
-
-        
-        data_start_offset = file.seek(SeekFrom::Current(0))?;
-
-        for (name, entry) in self.indexes.iter_mut() {
-            if entry.to_delete {
-                continue;
-            }
-
-            let raw_data = if let Some(data) = &entry.data {
-                data.clone()
+        for (name, entry) in files {
+            let data = if let Some(d) = &entry.data {
+                d.clone()
             } else {
-                
-                let mut f = File::open(self.archive_path.as_ref().unwrap()).unwrap();
-                f.seek(SeekFrom::Start(entry.offset)).unwrap();
-                let mut buffer = vec![0; entry.length as usize];
-                f.read_exact(&mut buffer).unwrap();
-
-                if entry.prefix == b"RPAD" {
-                    let mut decoder = ZlibDecoder::new(&buffer[..]);
-                    let mut decompressed = Vec::new();
-                    decoder.read_to_end(&mut decompressed).unwrap();
-                    decompressed
-                } else {
-                    buffer
-                }
+                let start = entry.offset as usize;
+                let end = start + entry.length as usize;
+                old_data
+                    .get(start..end)
+                    .ok_or_else(|| anyhow::anyhow!("Data not found in old archive for {name}"))?
+                    .to_vec()
             };
 
-            
-            let mut compressed = Vec::new();
-            let mut encoder = ZlibEncoder::new(&mut compressed, Compression::new(self.compression_level));
-            encoder.write_all(&raw_data).unwrap();
-            encoder.finish().unwrap();
+            out.write_all(&data)?;
 
-            let offset = file.seek(SeekFrom::Current(0)).unwrap();
-            file.write_all(&compressed).unwrap();
+            if self.version == 3.0 {
+                new_indexes.insert(
+                    name.clone(),
+                    vec![(
+                        offset ^ self.key as u64,
+                        data.len() as u64 ^ self.key as u64,
+                    )],
+                );
+            } else {
+                new_indexes.insert(name.clone(), vec![(offset, data.len() as u64)]);
+            }
 
-            new_index.insert(name.clone(), RpaFileEntry {
-                offset,
-                length: compressed.len() as u64,
-                prefix: b"RPAD".to_vec(),
-                data: None,
-                modified: false,
-                to_delete: false,
-            });
+            offset += data.len() as u64;
         }
 
-        
-        let index_offset = file.seek(SeekFrom::Current(0)).unwrap();
-        let mut index_map = HashMap::new();
+        let raw_index = serde_pickle::to_vec(&new_indexes, Default::default())?;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw_index)?;
+        let compressed_index = encoder.finish()?;
 
-        for (name, entry) in &new_index {
-            index_map.insert(name, (entry.offset, entry.length, entry.prefix.clone()));
+        out.write_all(&compressed_index)?;
+
+        out.seek(SeekFrom::Start(0))?;
+        if self.version == 3.0 {
+            write!(out, "RPA-3.0 {:016x} {:08x}\n", offset, self.key)?;
+        } else {
+            write!(out, "RPA-2.0 {:016x}\n", offset)?;
         }
 
-        let index_json = serde_json::to_string(&index_map).unwrap();
-        let mut compressed_index = Vec::new();
-        let mut index_encoder = ZlibEncoder::new(&mut compressed_index, Compression::new(self.compression_level));
-        index_encoder.write_all(index_json.as_bytes()).unwrap();
-        index_encoder.finish().unwrap();
-
-        file.write_all(&compressed_index).unwrap();
-
-        
-        file.write_all(format!("{:016x}", index_offset).as_bytes()).unwrap();
-
-        self.status_message = format!("Archive sauvegardée : {}", output_path);
-        self.modified = false;
         Ok(())
     }
 
-    
-    fn create_proper_index(&self, indexes: &HashMap<String, RpaFileEntry>) -> anyhow::Result<Vec<u8>> {
-        println!("🔨 Creating proper RPA index for {} files", indexes.len());
-        let mut index_data = HashMap::new();
+    //
 
-        for (filename, entry) in indexes {
-            index_data.insert(filename.clone(), vec![(entry.offset, entry.length)]);
-        }
-
-        let pickle_data = serde_pickle::to_vec(&index_data, Default::default())?;
-        
-        Ok(pickle_data)
-    }
-
-    fn write_pickle_string(&self, data: &mut Vec<u8>, s: &str) {
-        let bytes = s.as_bytes();
-
-        if bytes.len() < 256 {
-            data.push(b'U');
-            data.push(bytes.len() as u8);
-        } else {
-            
-            data.push(b'T');
-            data.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        }
-
-        data.extend_from_slice(bytes);
-        data.push(b'q'); 
-        data.extend_from_slice(&[0x00]); 
-    }
-
-    fn write_pickle_int(&self, data: &mut Vec<u8>, n: u32) {
-        
-        data.push(b'J');
-        data.extend_from_slice(&n.to_le_bytes());
-    }
-
-
-    
     fn format_bytes(bytes: u64) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
         let mut size = bytes as f64;
@@ -991,7 +825,11 @@ impl RpaEditor {
 
     fn get_file_icon(filename: &str) -> &'static str {
         let lower = filename.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") {
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+        {
             "🖼️"
         } else if lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".avi") {
             "🎬"
@@ -1006,7 +844,11 @@ impl RpaEditor {
 
     fn get_file_type_color(filename: &str) -> egui::Color32 {
         let lower = filename.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") {
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+        {
             egui::Color32::from_rgb(100, 200, 100)
         } else if lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".avi") {
             egui::Color32::from_rgb(200, 100, 100)
@@ -1021,7 +863,11 @@ impl RpaEditor {
 
     fn get_file_type(&self, filename: &str) -> &'static str {
         let lower = filename.to_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".webp") {
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+        {
             "images"
         } else if lower.ends_with(".webm") || lower.ends_with(".mp4") || lower.ends_with(".avi") {
             "videos"
@@ -1082,31 +928,27 @@ impl RpaEditor {
         self.dump_files_by_type("all", base_path)
     }
 
-    
     fn get_filtered_sorted_files(&self) -> Vec<(&String, &RpaFileEntry)> {
         let mut files: Vec<_> = self.indexes.iter().collect();
 
-        
         if self.filter_type != "all" {
-            files.retain(|(filename, _)| {
-                self.get_file_type(filename) == self.filter_type
-            });
+            files.retain(|(filename, _)| self.get_file_type(filename) == self.filter_type);
         }
 
-        
         if !self.search_filter.is_empty() {
             files.retain(|(filename, _)| {
-                filename.to_lowercase().contains(&self.search_filter.to_lowercase())
+                filename
+                    .to_lowercase()
+                    .contains(&self.search_filter.to_lowercase())
             });
         }
 
-        
         match self.sort_by.as_str() {
             "name" => files.sort_by(|(a, _), (b, _)| a.cmp(b)),
             "size" => files.sort_by(|(_, a), (_, b)| a.length.cmp(&b.length)),
-            "type" => files.sort_by(|(a, _), (b, _)| {
-                self.get_file_type(a).cmp(self.get_file_type(b))
-            }),
+            "type" => {
+                files.sort_by(|(a, _), (b, _)| self.get_file_type(a).cmp(self.get_file_type(b)))
+            }
             _ => {}
         }
 
@@ -1117,7 +959,6 @@ impl RpaEditor {
         files
     }
 
-    
     fn get_archive_statistics(&self) -> String {
         let counts = self.count_files_by_type();
         let total_size: u64 = self.indexes.values().map(|e| e.length).sum();
@@ -1156,7 +997,6 @@ impl RpaEditor {
         )
     }
 
-    
     fn batch_replace_from_folder(&mut self, folder_path: &str) -> anyhow::Result<usize> {
         let folder = std::path::Path::new(folder_path);
         let mut replaced_count = 0;
@@ -1169,13 +1009,12 @@ impl RpaEditor {
                 if let Some(filename) = file_path.file_name() {
                     let filename_str = filename.to_string_lossy().to_string();
 
-                    
                     if self.indexes.contains_key(&filename_str) {
                         match self.replace_file(&filename_str, &file_path.to_string_lossy()) {
                             Ok(()) => {
                                 replaced_count += 1;
                                 println!("🔄 Replaced: {}", filename_str);
-                            },
+                            }
                             Err(e) => {
                                 println!("❌ Failed to replace {}: {}", filename_str, e);
                             }
@@ -1188,7 +1027,6 @@ impl RpaEditor {
         self.status_message = format!("Batch replaced {} files", replaced_count);
         Ok(replaced_count)
     }
-
 }
 
 impl eframe::App for RpaEditor {
@@ -1206,11 +1044,10 @@ impl eframe::App for RpaEditor {
             println!("{filename}, {new_path}");
             match self.replace_file(&filename, &new_path) {
                 Ok(()) => {
-                    
                     if self.selected_file.as_ref() == Some(&filename) {
                         self.preview_file(&filename);
                     }
-                },
+                }
                 Err(e) => {
                     self.status_message = format!("Replace error: {}", e);
                 }
@@ -1221,24 +1058,23 @@ impl eframe::App for RpaEditor {
             match self.batch_replace_from_folder(&folder_path) {
                 Ok(count) => {
                     self.status_message = format!("Batch replaced {} files", count);
-                },
+                }
                 Err(e) => {
                     self.status_message = format!("Batch replace error: {}", e);
                 }
             }
         }
 
-
-        
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open RPA").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("RPA files", &["rpa"])
-                            .pick_file() {
+                            .pick_file()
+                        {
                             match self.load_rpa(&path.to_string_lossy()) {
-                                Ok(()) => {},
+                                Ok(()) => {}
                                 Err(e) => {
                                     self.status_message = format!("Error loading: {}", e);
                                 }
@@ -1250,7 +1086,7 @@ impl eframe::App for RpaEditor {
                     if ui.button("Save").clicked() && self.archive_path.is_some() {
                         let path = self.archive_path.clone().unwrap();
                         match self.save_rpa(&path) {
-                            Ok(()) => {},
+                            Ok(()) => {}
                             Err(e) => {
                                 self.status_message = format!("Save error: {}", e);
                             }
@@ -1261,9 +1097,10 @@ impl eframe::App for RpaEditor {
                     if ui.button("Save As...").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .add_filter("RPA files", &["rpa"])
-                            .save_file() {
+                            .save_file()
+                        {
                             match self.save_rpa(&path.to_string_lossy()) {
-                                Ok(()) => {},
+                                Ok(()) => {}
                                 Err(e) => {
                                     self.status_message = format!("Save error: {}", e);
                                 }
@@ -1283,7 +1120,12 @@ impl eframe::App for RpaEditor {
                         if ui.button("🎯 Extract All Files").clicked() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 match self.dump_all_files(&folder) {
-                                    Ok(count) => self.status_message = format!("Extracted {} files to organized folders", count),
+                                    Ok(count) => {
+                                        self.status_message = format!(
+                                            "Extracted {} files to organized folders",
+                                            count
+                                        )
+                                    }
                                     Err(e) => self.status_message = format!("Extract Error: {}", e),
                                 }
                                 self.show_dump_dialog = false;
@@ -1300,38 +1142,35 @@ impl eframe::App for RpaEditor {
                             let file_path = path.to_string_lossy().to_string();
                             println!("🔍 Selected replacement file: {}", file_path);
 
-                            
                             if std::path::Path::new(&file_path).exists() {
                                 self.file_to_replace = Some((filename.unwrap(), file_path));
                             } else {
-                                self.status_message = format!("Selected file does not exist: {}", file_path);
+                                self.status_message =
+                                    format!("Selected file does not exist: {}", file_path);
                             }
                         }
                         ui.close_menu();
                     }
-
                 });
 
-                
                 if self.modified {
                     ui.colored_label(egui::Color32::YELLOW, "● Modified");
                 }
             });
         });
 
-
-        
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_message);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.indexes.is_empty() {
                         let counts = self.count_files_by_type();
-                        ui.label(format!("🖼️{} 🎬{} 🎵{} 📜{}",
-                                         counts.get("images").unwrap_or(&0),
-                                         counts.get("videos").unwrap_or(&0),
-                                         counts.get("audio").unwrap_or(&0),
-                                         counts.get("scripts").unwrap_or(&0)
+                        ui.label(format!(
+                            "🖼️{} 🎬{} 🎵{} 📜{}",
+                            counts.get("images").unwrap_or(&0),
+                            counts.get("videos").unwrap_or(&0),
+                            counts.get("audio").unwrap_or(&0),
+                            counts.get("scripts").unwrap_or(&0)
                         ));
                         ui.separator();
 
@@ -1350,14 +1189,12 @@ impl eframe::App for RpaEditor {
             });
         });
 
-        
         egui::SidePanel::left("file_list")
             .resizable(true)
             .default_width(400.0)
             .width_range(300.0..=700.0)
             .show(ctx, |ui| {
                 ui.vertical(|ui| {
-                    
                     ui.horizontal(|ui| {
                         ui.heading("📂 Files");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1370,7 +1207,6 @@ impl eframe::App for RpaEditor {
                         });
                     });
 
-                    
                     ui.horizontal(|ui| {
                         for (filter, icon) in [
                             ("all", "📁"),
@@ -1380,7 +1216,10 @@ impl eframe::App for RpaEditor {
                             ("scripts", "📜"),
                         ] {
                             let is_selected = self.filter_type == filter;
-                            if ui.selectable_label(is_selected, format!("{} {}", icon, filter)).clicked() {
+                            if ui
+                                .selectable_label(is_selected, format!("{} {}", icon, filter))
+                                .clicked()
+                            {
                                 self.filter_type = filter.to_string();
                             }
                         }
@@ -1388,7 +1227,6 @@ impl eframe::App for RpaEditor {
 
                     ui.separator();
 
-                    
                     ui.horizontal(|ui| {
                         ui.label("🔍");
                         ui.text_edit_singleline(&mut self.search_filter);
@@ -1399,33 +1237,29 @@ impl eframe::App for RpaEditor {
 
                     ui.separator();
 
-                    
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             let files = self.get_filtered_sorted_files();
 
-                            
                             let mut file_to_select: Option<String> = None;
                             let mut file_to_preview: Option<String> = None;
 
                             for (filename, entry) in files {
                                 let is_selected = Some(filename) == self.selected_file.as_ref();
 
-                                
                                 let filename_clone = filename.clone();
 
                                 ui.horizontal(|ui| {
                                     ui.set_min_height(25.0);
 
-                                    
                                     ui.label(Self::get_file_icon(filename));
 
-                                    
                                     let mut text = egui::RichText::new(filename);
 
                                     if entry.to_delete {
-                                        text = text.strikethrough().color(egui::Color32::LIGHT_GRAY);
+                                        text =
+                                            text.strikethrough().color(egui::Color32::LIGHT_GRAY);
                                     } else if entry.modified {
                                         text = text.color(egui::Color32::LIGHT_YELLOW);
                                     } else {
@@ -1433,25 +1267,27 @@ impl eframe::App for RpaEditor {
                                     }
 
                                     if ui.selectable_label(is_selected, text).clicked() {
-                                        
                                         file_to_select = Some(filename_clone.clone());
                                         file_to_preview = Some(filename_clone);
                                     }
 
-                                    
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(
-                                            egui::RichText::new(Self::format_bytes(entry.length))
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(Self::format_bytes(
+                                                    entry.length,
+                                                ))
                                                 .small()
-                                                .weak()
-                                        );
-                                    });
+                                                .weak(),
+                                            );
+                                        },
+                                    );
                                 });
 
                                 ui.separator();
                             }
 
-                            
                             if let Some(selected) = file_to_select {
                                 self.selected_file = Some(selected);
                             }
@@ -1459,14 +1295,11 @@ impl eframe::App for RpaEditor {
                                 self.file_to_preview = Some(preview);
                             }
                         });
-
                 });
             });
 
-        
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ref selected) = self.selected_file.clone() {
-                
                 ui.horizontal(|ui| {
                     ui.heading(format!("{} {}", Self::get_file_icon(selected), selected));
 
@@ -1474,9 +1307,13 @@ impl eframe::App for RpaEditor {
                         if let Some(ref _img) = self.preview_image {
                             ui.horizontal(|ui| {
                                 ui.label("🔍");
-                                if ui.add(egui::Slider::new(&mut self.image_zoom, 0.1..=3.0).text("Zoom")).changed() {
-                                    
-                                }
+                                if ui
+                                    .add(
+                                        egui::Slider::new(&mut self.image_zoom, 0.1..=3.0)
+                                            .text("Zoom"),
+                                    )
+                                    .changed()
+                                {}
                             });
                         }
                     });
@@ -1484,7 +1321,6 @@ impl eframe::App for RpaEditor {
 
                 ui.separator();
 
-                
                 ui.horizontal(|ui| {
                     let selected_clone = selected.clone();
 
@@ -1507,7 +1343,28 @@ impl eframe::App for RpaEditor {
 
                     if ui.button("🔄 Replace").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.file_to_replace = Some((path.to_string_lossy().to_string(), selected_clone.clone()));
+                            self.file_to_replace =
+                                Some((path.to_string_lossy().to_string(), selected_clone.clone()));
+                        }
+                    }
+
+                    if ui
+                        .button(if self.is_playing {
+                            "Stop Audio"
+                        } else {
+                            "Play Audio"
+                        })
+                        .clicked()
+                    {
+                        if self.is_playing {
+                            self.audio_player.stop();
+                            self.is_playing = false;
+                        } else {
+                            if let Ok(data) = self.load_file_data(&selected_clone) {
+                                println!("Playing audio {}", selected_clone);
+                                self.audio_player.play_bytes(data);
+                                self.is_playing = true;
+                            }
                         }
                     }
 
@@ -1522,64 +1379,75 @@ impl eframe::App for RpaEditor {
                                     }
                                     if std::fs::write(&file_path, data).is_ok() {
                                         #[cfg(target_os = "windows")]
-                                        let _ = std::process::Command::new("explorer").arg(&extract_dir).spawn();
+                                        let _ = std::process::Command::new("explorer")
+                                            .arg(&extract_dir)
+                                            .spawn();
 
                                         #[cfg(target_os = "macos")]
-                                        let _ = std::process::Command::new("open").arg(&extract_dir).spawn();
+                                        let _ = std::process::Command::new("open")
+                                            .arg(&extract_dir)
+                                            .spawn();
 
                                         #[cfg(target_os = "linux")]
-                                        let _ = std::process::Command::new("xdg-open").arg(&extract_dir).spawn();
+                                        let _ = std::process::Command::new("xdg-open")
+                                            .arg(&extract_dir)
+                                            .spawn();
 
-                                        self.status_message = format!("Opened folder for {}", selected_clone);
+                                        self.status_message =
+                                            format!("Opened folder for {}", selected_clone);
                                     }
                                 }
                             }
-                        }
-                    }
-
-                    
-                    if let Some(ref data) = self.preview_data {
-                        if ui.button("🔐 Copy Hash").clicked() {
-                            let hash = md5::compute(data);
-                            ui.output_mut(|o| o.copied_text = format!("{:x}", hash));
-                            self.status_message = "Hash copied to clipboard".to_string();
                         }
                     }
                 });
 
                 ui.separator();
 
-                
                 egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if let Some(ref img) = self.preview_image {
-                            
-                            let texture = ctx.load_texture("preview", img.clone(), Default::default());
+                            let texture =
+                                ctx.load_texture("preview", img.clone(), Default::default());
                             let max_size = ui.available_size();
                             let img_size = egui::Vec2::new(img.width() as f32, img.height() as f32);
 
-                            let base_scale = (max_size.x / img_size.x).min(max_size.y / img_size.y).min(1.0);
+                            let base_scale = (max_size.x / img_size.x)
+                                .min(max_size.y / img_size.y)
+                                .min(1.0);
                             let display_size = img_size * base_scale * self.image_zoom;
 
-                            ui.image(&texture);
+                            ui.add(
+                                egui::Image::new(&texture)
+                                    .max_size(display_size)
+                                    .maintain_aspect_ratio(true),
+                            );
 
                             ui.separator();
-                            ui.label(format!("Original: {}×{} | Display: {:.0}×{:.0} | Zoom: {:.1}%",
-                                             img.width(), img.height(),
-                                             display_size.x, display_size.y,
-                                             base_scale * self.image_zoom * 100.0
+                            ui.label(format!(
+                                "Original: {}×{} | Display: {:.0}×{:.0} | Zoom: {:.1}%",
+                                img.width(),
+                                img.height(),
+                                display_size.x,
+                                display_size.y,
+                                base_scale * self.image_zoom * 100.0
                             ));
-                        }
-                        else if let Some(ref text) = self.preview_text {
-                            
+                        } else if let Some(ref text) = self.preview_text {
                             let lines: Vec<&str> = text.lines().collect();
                             for line in lines {
                                 if line.starts_with('#') {
                                     ui.colored_label(egui::Color32::LIGHT_GREEN, line);
-                                } else if line.contains("label") || line.contains("menu") || line.contains("scene") {
+                                } else if line.contains("label")
+                                    || line.contains("menu")
+                                    || line.contains("scene")
+                                {
                                     ui.colored_label(egui::Color32::LIGHT_BLUE, line);
-                                } else if line.contains("Format:") || line.contains("Size:") || line.starts_with("🎬") || line.starts_with("🎵") {
+                                } else if line.contains("Format:")
+                                    || line.contains("Size:")
+                                    || line.starts_with("🎬")
+                                    || line.starts_with("🎵")
+                                {
                                     ui.colored_label(egui::Color32::LIGHT_YELLOW, line);
                                 } else if line.starts_with("✅") || line.starts_with("📊") {
                                     ui.colored_label(egui::Color32::CYAN, line);
@@ -1587,9 +1455,7 @@ impl eframe::App for RpaEditor {
                                     ui.label(line);
                                 }
                             }
-                        }
-                        else if let Some(ref data) = self.preview_data {
-                            
+                        } else if let Some(ref data) = self.preview_data {
                             ui.horizontal(|ui| {
                                 ui.label("📊 File size:");
                                 ui.strong(Self::format_bytes(data.len() as u64));
@@ -1600,7 +1466,8 @@ impl eframe::App for RpaEditor {
                                     self.hex_view_offset = 0;
                                 }
                                 if ui.button("⬇️ Next").clicked() {
-                                    self.hex_view_offset = (self.hex_view_offset + 512).min(data.len().saturating_sub(512));
+                                    self.hex_view_offset = (self.hex_view_offset + 512)
+                                        .min(data.len().saturating_sub(512));
                                 }
                                 if ui.button("⬆️ Prev").clicked() {
                                     self.hex_view_offset = self.hex_view_offset.saturating_sub(512);
@@ -1609,7 +1476,6 @@ impl eframe::App for RpaEditor {
 
                             ui.separator();
 
-                            
                             ui.heading("🔍 Hex Preview");
 
                             let start_offset = self.hex_view_offset;
@@ -1621,13 +1487,21 @@ impl eframe::App for RpaEditor {
                                     .enumerate()
                                     .map(|(i, chunk)| {
                                         let addr = start_offset + i * 16;
-                                        let hex: String = chunk.iter()
+                                        let hex: String = chunk
+                                            .iter()
                                             .map(|b| format!("{:02X}", b))
                                             .collect::<Vec<_>>()
                                             .join(" ");
 
-                                        let ascii: String = chunk.iter()
-                                            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                                        let ascii: String = chunk
+                                            .iter()
+                                            .map(|&b| {
+                                                if b.is_ascii_graphic() || b == b' ' {
+                                                    b as char
+                                                } else {
+                                                    '.'
+                                                }
+                                            })
                                             .collect();
 
                                         format!("{:08X}: {:<48} {}", addr, hex, ascii)
@@ -1638,13 +1512,15 @@ impl eframe::App for RpaEditor {
                                 ui.code(&hex_dump);
 
                                 if start_offset + preview_bytes < data.len() {
-                                    ui.label(format!("... and {} more bytes", data.len() - start_offset - preview_bytes));
+                                    ui.label(format!(
+                                        "... and {} more bytes",
+                                        data.len() - start_offset - preview_bytes
+                                    ));
                                 }
                             }
                         }
                     });
             } else {
-                
                 ui.centered_and_justified(|ui| {
                     ui.vertical_centered(|ui| {
                         ui.heading("🎮 RPA Archive Editor - Enhanced");
@@ -1668,7 +1544,6 @@ impl eframe::App for RpaEditor {
             }
         });
 
-        
         if self.show_add_dialog {
             egui::Window::new("➕ Add File")
                 .collapsible(false)
@@ -1684,7 +1559,8 @@ impl eframe::App for RpaEditor {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
                                 self.add_file_path = path.to_string_lossy().to_string();
                                 if self.add_file_name.is_empty() {
-                                    self.add_file_name = path.file_name()
+                                    self.add_file_name = path
+                                        .file_name()
                                         .unwrap_or_default()
                                         .to_string_lossy()
                                         .to_string();
@@ -1725,7 +1601,6 @@ impl eframe::App for RpaEditor {
                 });
         }
 
-        
         if self.show_batch_replace_dialog {
             egui::Window::new("📁 Batch Replace")
                 .collapsible(false)
@@ -1754,8 +1629,8 @@ impl eframe::App for RpaEditor {
                     ui.horizontal(|ui| {
                         if ui.button("🔄 Replace All").clicked() {
                             if !self.batch_replace_folder.is_empty() {
-                                
-                                self.batch_replace_to_execute = Some(self.batch_replace_folder.clone());
+                                self.batch_replace_to_execute =
+                                    Some(self.batch_replace_folder.clone());
                             }
                         }
 
@@ -1767,7 +1642,6 @@ impl eframe::App for RpaEditor {
                 });
         }
 
-        
         if self.show_statistics_dialog {
             egui::Window::new("📊 Archive Statistics")
                 .collapsible(false)
@@ -1795,7 +1669,6 @@ impl eframe::App for RpaEditor {
                 });
         }
 
-        
         if self.show_backup_dialog {
             egui::Window::new("🔄 Backup History")
                 .collapsible(false)
@@ -1810,11 +1683,16 @@ impl eframe::App for RpaEditor {
                             for backup in &self.backup_history {
                                 ui.horizontal(|ui| {
                                     ui.label(format!("📄 {}", backup.filename));
-                                    ui.label(format!("({:.1} KB)", backup.data.len() as f32 / 1024.0));
-                                    ui.label(format!("📅 {}", backup.timestamp.format("%Y-%m-%d %H:%M")));
+                                    ui.label(format!(
+                                        "({:.1} KB)",
+                                        backup.data.len() as f32 / 1024.0
+                                    ));
+                                    ui.label(format!(
+                                        "📅 {}",
+                                        backup.timestamp.format("%Y-%m-%d %H:%M")
+                                    ));
 
                                     if ui.button("📤 Restore").clicked() {
-                                        
                                         let entry = RpaFileEntry {
                                             offset: 0,
                                             length: backup.data.len() as u64,
@@ -1825,7 +1703,8 @@ impl eframe::App for RpaEditor {
                                         };
                                         self.indexes.insert(backup.filename.clone(), entry);
                                         self.modified = true;
-                                        self.status_message = format!("Restored backup of {}", backup.filename);
+                                        self.status_message =
+                                            format!("Restored backup of {}", backup.filename);
                                     }
                                 });
                                 ui.separator();
@@ -1846,7 +1725,6 @@ impl eframe::App for RpaEditor {
                 });
         }
 
-        
         if self.show_dump_dialog {
             egui::Window::new("📤 Bulk Extract")
                 .collapsible(false)
@@ -1860,12 +1738,16 @@ impl eframe::App for RpaEditor {
 
                     let counts = self.count_files_by_type();
 
-                    
                     ui.horizontal(|ui| {
                         if ui.button("🎯 Extract All Files").clicked() {
                             if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                 match self.dump_all_files(&folder) {
-                                    Ok(count) => self.status_message = format!("Extracted {} files to organized folders", count),
+                                    Ok(count) => {
+                                        self.status_message = format!(
+                                            "Extracted {} files to organized folders",
+                                            count
+                                        )
+                                    }
                                     Err(e) => self.status_message = format!("Extract Error: {}", e),
                                 }
                                 self.show_dump_dialog = false;
@@ -1876,7 +1758,6 @@ impl eframe::App for RpaEditor {
 
                     ui.separator();
 
-                    
                     for (file_type, icon) in [
                         ("images", "🖼️"),
                         ("videos", "🎬"),
@@ -1887,11 +1768,26 @@ impl eframe::App for RpaEditor {
                         let count = counts.get(file_type).unwrap_or(&0);
                         if *count > 0 {
                             ui.horizontal(|ui| {
-                                if ui.button(format!("{} Extract {}", icon, file_type.to_uppercase())).clicked() {
+                                if ui
+                                    .button(format!(
+                                        "{} Extract {}",
+                                        icon,
+                                        file_type.to_uppercase()
+                                    ))
+                                    .clicked()
+                                {
                                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                                         match self.dump_files_by_type(file_type, &folder) {
-                                            Ok(extracted) => self.status_message = format!("Extracted {} {} files", extracted, file_type),
-                                            Err(e) => self.status_message = format!("Extract Error: {}", e),
+                                            Ok(extracted) => {
+                                                self.status_message = format!(
+                                                    "Extracted {} {} files",
+                                                    extracted, file_type
+                                                )
+                                            }
+                                            Err(e) => {
+                                                self.status_message =
+                                                    format!("Extract Error: {}", e)
+                                            }
                                         }
                                         self.show_dump_dialog = false;
                                     }
@@ -1925,4 +1821,36 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Ok(Box::new(RpaEditor::new(cc)))),
     )
+}
+
+pub struct AudioPlayer {
+    sink: Sink,
+    _stream: OutputStream,
+}
+
+impl AudioPlayer {
+    pub fn new() -> Self {
+        let (_stream, handle) =
+            OutputStream::try_default().expect("Erreur lors de la création du périphérique audio");
+        let sink = Sink::try_new(&handle).expect("Erreur lors de la création du Sink audio");
+        Self { sink, _stream }
+    }
+
+    pub fn play_bytes(&self, data: Vec<u8>) {
+        let cursor = Cursor::new(data);
+        let source = Decoder::new(cursor);
+        match source {
+            Ok(e) => {
+                self.sink.append(e);
+                self.sink.play();
+            }
+            Err(e) => {
+                eprintln!("Error playing audio: {}", e);
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        self.sink.stop();
+    }
 }
