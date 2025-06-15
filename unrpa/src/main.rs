@@ -199,7 +199,6 @@ impl eframe::App for RpaEditor {
 
                             for (filename, entry) in files {
                                 let is_selected = Some(filename) == self.selected_file.as_ref();
-
                                 let filename_clone = filename.clone();
 
                                 ui.horizontal(|ui| {
@@ -210,14 +209,17 @@ impl eframe::App for RpaEditor {
                                     let mut text = egui::RichText::new(filename);
 
                                     if entry.to_delete {
-                                        text = text.strikethrough().color(egui::Color32::LIGHT_GRAY);
+                                        text = text.strikethrough().color(egui::Color32::RED);
                                     } else if entry.modified {
-                                        text = text.color(egui::Color32::LIGHT_YELLOW);
+                                        text = text.color(egui::Color32::YELLOW);
                                     } else {
                                         text = text.color(Self::get_file_type_color(filename));
                                     }
 
-                                    if ui.selectable_label(is_selected, text).clicked() {
+                                    let label = ui.selectable_label(is_selected, text);
+                                    
+                                    
+                                    if label.clicked() {
                                         file_to_select = Some(filename_clone.clone());
                                         file_to_preview = Some(filename_clone);
                                     }
@@ -796,6 +798,7 @@ impl AudioPlayer {
     }
 
     pub fn play_bytes(&self, data: Vec<u8>) {
+        println!("Playing audio: {:?}", String::from_utf8_lossy(&data[0..20]));
         let cursor = Cursor::new(data);
         let source = Decoder::new(cursor);
         match source {

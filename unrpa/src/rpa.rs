@@ -604,28 +604,25 @@ impl RpaEditor {
             data.len()
         ));
 
-        if lower.ends_with(".webm") && data.len() > 20 {
-            info.push_str("🎬 Format: WebM (VP8/VP9)\n");
+        if data.len() > 20 {
             if data[0..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+                info.push_str("🎬 Format: WebM (VP8/VP9)\n");
                 info.push_str("✅ Valid EBML header detected\n");
                 info.push_str("📹 Container: Matroska-based\n");
-            }
-        } else if lower.ends_with(".mp4") && data.len() > 20 {
-            info.push_str("🎬 Format: MP4 (H.264/H.265)\n");
-            if &data[4..8] == b"ftyp" {
+            } else if &data[4..8] == b"ftyp" {
+                info.push_str("🎬 Format: MP4 (H.264/H.265)\n");
+
                 info.push_str("✅ Valid MP4 header detected\n");
                 let brand = String::from_utf8_lossy(&data[8..12]);
                 info.push_str(&format!("🏷️ Brand: {}\n", brand));
-            }
-        } else if lower.ends_with(".ogg") && data.len() > 4 {
-            info.push_str("🎵 Format: OGG Vorbis\n");
-            if &data[0..4] == b"OggS" {
+            } else if &data[0..4] == b"OggS" {
+                info.push_str("🎵 Format: OGG Vorbis\n");
+
                 info.push_str("✅ Valid OGG header detected\n");
                 info.push_str("🎶 Codec: Vorbis audio\n");
-            }
-        } else if lower.ends_with(".wav") && data.len() > 44 {
-            info.push_str("🎵 Format: WAV (Uncompressed)\n");
-            if &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+            } else if &data[0..4] == b"RIFF" && &data[8..12] == b"WAVE" {
+                info.push_str("🎵 Format: WAV (Uncompressed)\n");
+
                 info.push_str("✅ Valid WAV header detected\n");
 
                 let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
@@ -640,10 +637,9 @@ impl RpaEditor {
                     info.push_str(&format!("📏 Bits: {} bit\n", bits_per_sample));
                     info.push_str(&format!("⏱️ Duration: ~{}s\n", duration));
                 }
-            }
-        } else if lower.ends_with(".mp3") && data.len() > 10 {
-            info.push_str("🎵 Format: MP3 (MPEG Audio)\n");
-            if &data[0..3] == b"ID3" {
+            } else if &data[0..3] == b"ID3" {
+                info.push_str("🎵 Format: MP3 (MPEG Audio)\n");
+
                 info.push_str("✅ ID3 tags detected\n");
                 let version = data[3];
                 info.push_str(&format!("🏷️ ID3 Version: 2.{}\n", version));
