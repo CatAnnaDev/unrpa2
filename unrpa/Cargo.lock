@@ -3246,6 +3246,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpa_editor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "eframe",
+ "egui",
+ "flate2",
+ "image",
+ "rfd",
+ "rodio",
+ "serde-pickle",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3868,21 +3883,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "unrpa"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "eframe",
- "egui",
- "flate2",
- "image",
- "rfd",
- "rodio",
- "serde-pickle",
-]
 
 [[package]]
 name = "url"
