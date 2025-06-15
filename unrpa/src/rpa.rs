@@ -91,7 +91,6 @@ impl Default for RpaEditor {
             file_to_replace: None,
             batch_replace_to_execute: None,
             show_dump_dialog: false,
-
             show_backup_dialog: false,
             backup_history: Vec::new(),
             show_batch_replace_dialog: false,
@@ -99,18 +98,15 @@ impl Default for RpaEditor {
             show_statistics_dialog: false,
             auto_backup: true,
             compression_level: 6,
-
             filter_type: "all".to_string(),
             sort_by: "name".to_string(),
             sort_ascending: true,
-
             image_zoom: 1.0,
             hex_view_offset: 0,
             audio_player: AudioPlayer::new(),
             is_playing: false,
             show_close_confirm: false,
             toasts: Vec::new(),
-
             audio_device: AudioDevice::new().unwrap(),
             player: None,
         }
@@ -655,17 +651,6 @@ impl RpaEditor {
                 info.push_str("✅ Valid MP3 frame header detected\n");
             }
         }
-
-        //info.push_str("\n💡 Usage Notes:\n");
-        //info.push_str("• Use 'Extract' to save the file\n");
-        //info.push_str("• Use 'Open Folder' to extract & view\n");
-        //if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3") {
-        //    info.push_str("• use play audio button\n");
-        //}
-
-        //if lower.ends_with(".webm") || lower.ends_with(".mp4") {
-        //    info.push_str("• Media preview not available in editor")
-        //}
 
         info
     }

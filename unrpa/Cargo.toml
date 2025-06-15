@@ -3,12 +3,13 @@ name = "rpa_editor"
 version = "0.1.0"
 edition = "2024"
 
+
+
 [dependencies]
 # Core
 flate2 = "1.1.1"
 anyhow = "1.0.98"
 rodio = "0.20.1"
-
 
 # GUI
 eframe = "0.29.1"

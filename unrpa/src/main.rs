@@ -3,12 +3,12 @@ mod toast;
 
 use crate::rpa::{RpaEditor, RpaFileEntry};
 use eframe::egui;
-use egui::Slider;
 use egui_video::Player;
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, Sink, Source};
 use std::fs::create_dir_all;
 use std::io::Cursor;
 use std::ops::Div;
+use std::time::{Duration, Instant};
 
 impl eframe::App for RpaEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -319,7 +319,6 @@ impl eframe::App for RpaEditor {
                         if self.is_playing {
                             self.audio_player.stop();
                             self.is_playing = false;
-                            self.player.take().unwrap().stop();
                             self.player = None;
                         } else {
                             if let Ok(data) = self.load_file_data(&selected_clone) {
@@ -331,6 +330,7 @@ impl eframe::App for RpaEditor {
                                     println!("Playing audio {}", selected_clone);
                                     self.audio_player.play_bytes(data);
                                     self.is_playing = true;
+
                                 } else if selected_clone.ends_with(".mp4")
                                     || selected_clone.ends_with(".avi")
                                     || selected_clone.ends_with(".mov")
@@ -384,6 +384,56 @@ impl eframe::App for RpaEditor {
                         }
                     }
                 });
+                
+                if self.is_playing {
+                    ui.group(|ui| {
+                        ui.heading("🎧 Audio Controller");
+
+                        if ui.button("⏸ Pause").clicked() {
+                            self.audio_player.pause();
+                        }
+
+                        if ui.button("▶ Play").clicked() {
+                            self.audio_player.resume();
+                        }
+
+                        if ui.button("⏹ Stop").clicked() {
+                            self.audio_player.stop();
+                        }
+
+                        let mut volume = self.audio_player.get_volume();
+                        if ui
+                            .add(egui::Slider::new(&mut volume, 0.0..=1.0).text("🔊 Volume"))
+                            .changed()
+                        {
+                            self.audio_player.set_volume(volume);
+                        }
+
+                        if self.audio_player.is_finished() {
+                            self.is_playing = false;
+                        } else {
+                            ui.label("🎵 En cours de lecture...");
+                        }
+
+                        if let Some(dur) = self.audio_player.total_duration() {
+                            let pos = self.audio_player.playback_position();
+
+                            let mut percent = pos.as_secs_f32() / dur.as_secs_f32();
+                            percent = percent.clamp(0.0, 1.0);
+
+                            ui.add_enabled_ui(false, |ui|{
+                                ui.add(
+                                    egui::Slider::new(&mut percent, 0.0..=1.0)
+                                        .text(format!(
+                                            "{:.0}/{:.0} sec",
+                                            pos.as_secs_f32(),
+                                            dur.as_secs_f32()
+                                        )),
+                                ); 
+                            });
+                        }
+                    });
+                }
 
                 if let Some(player) = self.player.as_mut() {
                     player.ui(ui, player.size.div(2.5));
@@ -810,9 +860,13 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
+
 pub struct AudioPlayer {
     sink: Sink,
     _stream: OutputStream,
+    volume: f32,
+    started_at: Option<Instant>,
+    duration: Option<Duration>,
 }
 
 impl AudioPlayer {
@@ -820,25 +874,69 @@ impl AudioPlayer {
         let (_stream, handle) =
             OutputStream::try_default().expect("Erreur lors de la création du périphérique audio");
         let sink = Sink::try_new(&handle).expect("Erreur lors de la création du Sink audio");
-        Self { sink, _stream }
+        sink.set_volume(1.0);
+        Self {
+            sink,
+            _stream,
+            volume: 1.0,
+            started_at: None,
+            duration: None,
+        }
     }
 
-    pub fn play_bytes(&self, data: Vec<u8>) {
-        println!("Playing audio: {:?}", String::from_utf8_lossy(&data[0..20]));
-        let cursor = Cursor::new(data);
-        let source = Decoder::new(cursor);
-        match source {
-            Ok(e) => {
-                self.sink.append(e);
+    pub fn play_bytes(&mut self, data: Vec<u8>) {
+        let cursor = Cursor::new(data.clone());
+        match Decoder::new(cursor) {
+            Ok(source) => {
+                self.duration = source.total_duration();
+                self.started_at = Some(Instant::now());
+                self.sink.append(source);
                 self.sink.play();
             }
             Err(e) => {
-                eprintln!("Error playing audio: {}", e);
+                eprintln!("Erreur de lecture audio: {}", e);
             }
         }
     }
 
+    pub fn pause(&self) {
+        self.sink.pause();
+    }
+
+    pub fn resume(&self) {
+        self.sink.play();
+    }
+
     pub fn stop(&self) {
         self.sink.stop();
+    }
+
+    pub fn set_volume(&mut self, vol: f32) {
+        self.volume = vol;
+        self.sink.set_volume(vol);
+    }
+
+    pub fn get_volume(&self) -> f32 {
+        self.volume
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.sink.empty()
+    }
+
+    pub fn playback_position(&self) -> Duration {
+        if let Some(started) = self.started_at {
+            if self.sink.is_paused() {
+                Duration::ZERO
+            } else {
+                started.elapsed()
+            }
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    pub fn total_duration(&self) -> Option<Duration> {
+        self.duration
     }
 }
