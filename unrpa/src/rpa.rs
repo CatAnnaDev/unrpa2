@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use egui_video::{AudioDevice, Player};
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -61,7 +62,11 @@ pub struct RpaEditor {
     pub audio_player: AudioPlayer,
     pub is_playing: bool,
     pub show_close_confirm: bool,
-    pub(crate) toasts: Vec<Toast>,
+    pub toasts: Vec<Toast>,
+
+
+    pub audio_device: AudioDevice,
+    pub player: Option<Player>,
 }
 
 impl Default for RpaEditor {
@@ -105,6 +110,9 @@ impl Default for RpaEditor {
             is_playing: false,
             show_close_confirm: false,
             toasts: Vec::new(),
+
+            audio_device: AudioDevice::new().unwrap(),
+            player: None,
         }
     }
 }
@@ -648,16 +656,16 @@ impl RpaEditor {
             }
         }
 
-        info.push_str("\n💡 Usage Notes:\n");
-        info.push_str("• Use 'Extract' to save the file\n");
-        info.push_str("• Use 'Open Folder' to extract & view\n");
-        if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3") {
-            info.push_str("• use play audio button\n");
-        }
+        //info.push_str("\n💡 Usage Notes:\n");
+        //info.push_str("• Use 'Extract' to save the file\n");
+        //info.push_str("• Use 'Open Folder' to extract & view\n");
+        //if lower.ends_with(".ogg") || lower.ends_with(".wav") || lower.ends_with(".mp3") {
+        //    info.push_str("• use play audio button\n");
+        //}
 
-        if lower.ends_with(".webm") || lower.ends_with(".mp4") {
-            info.push_str("• Media preview not available in editor")
-        }
+        //if lower.ends_with(".webm") || lower.ends_with(".mp4") {
+        //    info.push_str("• Media preview not available in editor")
+        //}
 
         info
     }

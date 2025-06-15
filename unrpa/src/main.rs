@@ -1,14 +1,18 @@
 mod rpa;
 mod toast;
 
+use crate::rpa::{RpaEditor, RpaFileEntry};
 use eframe::egui;
+use egui::Slider;
+use egui_video::Player;
 use rodio::{Decoder, OutputStream, Sink};
 use std::fs::create_dir_all;
 use std::io::Cursor;
-use crate::rpa::{RpaEditor, RpaFileEntry};
+use std::ops::Div;
 
 impl eframe::App for RpaEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.request_repaint();
         if let Some(filename) = self.file_to_preview.take() {
             self.preview_file(&filename);
             self.selected_file = Some(filename);
@@ -46,7 +50,12 @@ impl eframe::App for RpaEditor {
         egui::TopBottomPanel::top("toasts_panel").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for toast in &self.toasts {
-                    ui.label(egui::RichText::new(&toast.message).background_color(egui::Color32::DARK_GREEN).color(egui::Color32::WHITE).strong());
+                    ui.label(
+                        egui::RichText::new(&toast.message)
+                            .background_color(egui::Color32::DARK_GREEN)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
                 }
             });
         });
@@ -104,7 +113,7 @@ impl eframe::App for RpaEditor {
 
         self.toasts.retain(|toast| !toast.is_expired());
 
-        self.show_top_panel(ctx, );
+        self.show_top_panel(ctx);
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -171,7 +180,10 @@ impl eframe::App for RpaEditor {
                             ("other", "📜"),
                         ] {
                             let is_selected = self.filter_type == filter;
-                            if ui.selectable_label(is_selected, format!("{} {}", icon, filter)).clicked() {
+                            if ui
+                                .selectable_label(is_selected, format!("{} {}", icon, filter))
+                                .clicked()
+                            {
                                 self.filter_type = filter.to_string();
                             }
                         }
@@ -217,8 +229,7 @@ impl eframe::App for RpaEditor {
                                     }
 
                                     let label = ui.selectable_label(is_selected, text);
-                                    
-                                    
+
                                     if label.clicked() {
                                         file_to_select = Some(filename_clone.clone());
                                         file_to_preview = Some(filename_clone);
@@ -228,9 +239,11 @@ impl eframe::App for RpaEditor {
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             ui.label(
-                                                egui::RichText::new(Self::format_bytes(entry.length))
-                                                    .small()
-                                                    .weak(),
+                                                egui::RichText::new(Self::format_bytes(
+                                                    entry.length,
+                                                ))
+                                                .small()
+                                                .weak(),
                                             );
                                         },
                                     );
@@ -248,7 +261,6 @@ impl eframe::App for RpaEditor {
                         });
                 });
             });
-
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(ref selected) = self.selected_file.clone() {
@@ -307,6 +319,8 @@ impl eframe::App for RpaEditor {
                         if self.is_playing {
                             self.audio_player.stop();
                             self.is_playing = false;
+                            self.player.take().unwrap().stop();
+                            self.player = None;
                         } else {
                             if let Ok(data) = self.load_file_data(&selected_clone) {
                                 if selected_clone.ends_with(".ogg")
@@ -323,7 +337,15 @@ impl eframe::App for RpaEditor {
                                     || selected_clone.ends_with(".mkv")
                                     || selected_clone.ends_with(".webm")
                                 {
-                                    // play video
+                                    println!("Playing video {}", selected_clone);
+                                    let byte_video = Player::from_bytes(ctx, &data).unwrap();
+                                    if let None = byte_video.audio_streamer {
+                                        self.player = Some(
+                                            byte_video.with_audio(&mut self.audio_device).unwrap(),
+                                        );
+                                    } else {
+                                        self.player = Some(byte_video);
+                                    }
                                 }
                             }
                         }
@@ -362,6 +384,10 @@ impl eframe::App for RpaEditor {
                         }
                     }
                 });
+
+                if let Some(player) = self.player.as_mut() {
+                    player.ui(ui, player.size.div(2.5));
+                }
 
                 ui.separator();
 
@@ -411,7 +437,7 @@ impl eframe::App for RpaEditor {
                                 {
                                     ui.colored_label(egui::Color32::LIGHT_YELLOW, line);
                                 } else if line.starts_with("✅") || line.starts_with("📊") {
-                                    ui.colored_label(egui::Color32::CYAN, line);
+                                    ui.colored_label(egui::Color32::from_rgb(0, 255, 255), line);
                                 } else {
                                     ui.label(line);
                                 }

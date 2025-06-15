@@ -9,12 +9,16 @@ flate2 = "1.1.1"
 anyhow = "1.0.98"
 rodio = "0.20.1"
 
+
 # GUI
-eframe = "0.31.1"
-egui = "0.31.1"
+eframe = "0.29.1"
+egui = "0.29.1"
+egui-video = { version = "0.9.0", features = ["sdl2-bundled", "from_bytes"] }
 
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 rfd = "0.15"  # File dialogs
 image = "0.25"  # Image preview
 serde-pickle = "1.2.0"
+
+
